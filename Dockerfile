@@ -12,12 +12,15 @@
 #   * The default command is `tail -f /dev/null`, so a freshly started
 #     container stays alive and idle until YOU start the server.
 #
-# Typical usage (details in README.md):
+# Typical usage (details in README.md): the image is built in GitHub Actions and
+# shipped as an artifact (a docker-save tar.gz), never pushed to a registry.
+#
+#   docker load -i simple-jev-latest-amd64.tar.gz
 #
 #   docker run -d --name simple-jev --gpus all \
 #     -p 8000:8000 \
 #     -v /host/path/to/models:/models \
-#     ghcr.io/<owner>/simple-jev-docker:latest
+#     simple-jev:latest
 #
 #   # ...then start the server inside the running container:
 #   docker exec -it simple-jev simple-jev \

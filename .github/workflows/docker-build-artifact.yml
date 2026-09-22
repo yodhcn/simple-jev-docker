@@ -1,0 +1,227 @@
+name: docker_image_build_artifact
+
+# 在 GitHub Actions 的 ubuntu runner 上构建 simple-jev 运行时镜像（CUDA 12.4 / GPU），
+# 然后用 `docker save` 导出成 tar.gz 上传为 workflow artifact。
+# 全程不推送到任何镜像仓库（GHCR / Docker Hub 都不用）。
+#
+# 只支持手动触发：仓库页面 -> Actions -> 左侧选本 workflow -> Run workflow。
+# 跑完之后在该次运行的页面底部 Artifacts 区域下载 tar.gz。
+#
+# 几个设计取舍：
+#   * 只做 linux/amd64。CUDA 12.4 的基镜像和 cu124 的 torch 索引都没有
+#     满足上游 torch>=2.6 的 arm64 wheel，跑 arm64 只会构建失败，
+#     详见 README「关于 arm64」。
+#   * tar.gz 而不是裸 tar。镜像本身约 7 GB，裸 tar 既占 artifact 空间又慢。
+#   * 基镜像和 PyTorch 索引由 Dockerfile 决定（单一事实来源），这里不重复传参，
+#     避免 workflow 和 Dockerfile 两处漂移。
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "给镜像打的 tag，决定 tar 里的镜像名 simple-jev:<tag>"
+        required: true
+        default: "latest"
+      simple_jev_ref:
+        description: "上游 simple-jev 的 ref（分支 / tag / commit SHA）"
+        required: true
+        default: "main"
+      torch_version:
+        description: "PyTorch 版本，留空表示用 cu124 索引里的最新版（2.6.0）"
+        required: false
+        default: ""
+      simple_jev_extras:
+        description: "上游 hf-server 的 extras（如 laya），留空为默认依赖集"
+        required: false
+        default: ""
+      cleanup:
+        description: "构建前清理 runner 磁盘空间（镜像约 7 GB，建议保持 true）"
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: docker-image-artifact-${{ inputs.image_tag }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_REPO: simple-jev
+  PLATFORM: linux/amd64
+  # 输入统一先落成环境变量再用，避免把输入直接拼进 shell 命令
+  INPUT_IMAGE_TAG: ${{ inputs.image_tag }}
+  INPUT_SIMPLE_JEV_REF: ${{ inputs.simple_jev_ref }}
+  INPUT_TORCH_VERSION: ${{ inputs.torch_version }}
+  INPUT_SIMPLE_JEV_EXTRAS: ${{ inputs.simple_jev_extras }}
+
+jobs:
+  build:
+    name: build and package image
+    runs-on: ubuntu-latest
+    # 构建 + 导出 + 压缩 + 上传，给足余量
+    timeout-minutes: 90
+
+    steps:
+      - name: Print workflow inputs
+        run: |
+          echo "image_tag         = ${INPUT_IMAGE_TAG}"
+          echo "simple_jev_ref    = ${INPUT_SIMPLE_JEV_REF}"
+          echo "torch_version     = ${INPUT_TORCH_VERSION}"
+          echo "simple_jev_extras = ${INPUT_SIMPLE_JEV_EXTRAS}"
+          echo "platform          = ${PLATFORM}"
+          echo "cleanup           = ${{ inputs.cleanup }}"
+
+      # CUDA 基镜像 + torch 加起来好几 GB，runner 默认剩余空间不够用
+      - name: Free disk space
+        if: ${{ inputs.cleanup }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Check out this repository
+        uses: actions/checkout@v4
+
+      - name: Compute image and artifact names
+        id: names
+        run: |
+          set -euo pipefail
+          # docker tag 只允许 [A-Za-z0-9_.-]，其余字符（含 /）统一换成下划线
+          SAFE_TAG=$(printf '%s' "${INPUT_IMAGE_TAG}" | sed 's/[^A-Za-z0-9_.-]/_/g')
+          if [ -z "${SAFE_TAG}" ]; then SAFE_TAG=latest; fi
+          ARCH="${PLATFORM##*/}"
+          ARTIFACT_NAME="${IMAGE_REPO}-${SAFE_TAG}-${ARCH}"
+          {
+            echo "SAFE_TAG=${SAFE_TAG}"
+            echo "ARCH=${ARCH}"
+            echo "IMAGE_REF=${IMAGE_REPO}:${SAFE_TAG}"
+            echo "ARTIFACT_NAME=${ARTIFACT_NAME}"
+            echo "TAR_PATH=${RUNNER_TEMP}/${ARTIFACT_NAME}.tar.gz"
+            echo "SHA_PATH=${RUNNER_TEMP}/${ARTIFACT_NAME}.tar.gz.sha256"
+            echo "MANIFEST_PATH=${RUNNER_TEMP}/${ARTIFACT_NAME}.manifest.txt"
+          } >> "$GITHUB_ENV"
+          echo "image_ref=${IMAGE_REPO}:${SAFE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          # 只进本地镜像库，不 push 到任何 registry
+          push: false
+          # load 到本地 daemon，后面 docker save 才有东西可导
+          load: true
+          tags: ${{ env.IMAGE_REF }}
+          build-args: |
+            SIMPLE_JEV_REF=${{ env.INPUT_SIMPLE_JEV_REF }}
+            SIMPLE_JEV_EXTRAS=${{ env.INPUT_SIMPLE_JEV_EXTRAS }}
+            TORCH_VERSION=${{ env.INPUT_TORCH_VERSION }}
+          # CUDA / PyTorch 那两层最大，缓存住能省掉每次重下 ~5 GB。
+          # 注意 gha 缓存每个仓库上限 10 GB，镜像大时可能被挤掉，属正常现象。
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Save image as tar.gz
+        run: |
+          set -euo pipefail
+          # pigz 是多线程 gzip，runner 上一般都有；没有就退回单线程 gzip
+          if command -v pigz >/dev/null 2>&1; then COMP=pigz; else COMP=gzip; fi
+          echo "compressor = ${COMP}"
+          # pipefail 保证 docker save 中途失败时这一步会失败，而不是留下半截文件
+          docker save "${IMAGE_REF}" | "${COMP}" > "${TAR_PATH}"
+          ls -lh "${TAR_PATH}"
+
+      - name: Write checksum and manifest
+        run: |
+          set -euo pipefail
+          TAR_DIR=$(dirname "${TAR_PATH}")
+          TAR_FILE=$(basename "${TAR_PATH}")
+
+          # 冒烟测试：镜像能跑起来、torch 能 import。构建期已经自检过一次，
+          # 这里只是再确认，所以失败不阻断流程 —— 不能让辛苦构建的镜像连 artifact 都传不上去。
+          TORCH_INFO=$(docker run --rm "${IMAGE_REF}" \
+            python -c 'import torch; print(torch.__version__, "cuda=" + str(torch.version.cuda))' \
+            2>/dev/null || echo "unknown")
+
+          # sha256 里只留文件名，这样下载到同一个目录后能直接 sha256sum -c
+          ( cd "${TAR_DIR}" && sha256sum "${TAR_FILE}" > "${TAR_FILE}.sha256" )
+          SHA=$(cut -d' ' -f1 "${SHA_PATH}")
+          SIZE=$(stat -c%s "${TAR_PATH}")
+
+          {
+            echo "image             = ${IMAGE_REF}"
+            echo "image_id          = $(docker image inspect "${IMAGE_REF}" --format '{{.Id}}')"
+            echo "image_size        = $(docker image inspect "${IMAGE_REF}" --format '{{.Size}}') bytes"
+            echo "platform          = ${PLATFORM}"
+            echo "torch             = ${TORCH_INFO}"
+            echo "upstream          = https://github.com/featherless-ai/simple-jev"
+            echo "upstream_ref      = ${INPUT_SIMPLE_JEV_REF}"
+            echo "simple_jev_extras = ${INPUT_SIMPLE_JEV_EXTRAS}"
+            echo "torch_version_arg = ${INPUT_TORCH_VERSION}"
+            echo "archive           = ${TAR_FILE}"
+            echo "archive_bytes     = ${SIZE}"
+            echo "archive_sha256    = ${SHA}"
+            echo "built_at_utc      = $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "built_by_run      = ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            echo "# 恢复到本机："
+            echo "#   docker load -i ${TAR_FILE}"
+            echo "#   docker run -d --name simple-jev --gpus all -p 8000:8000 \\"
+            echo "#     -v /host/path/to/models:/models ${IMAGE_REF}"
+          } > "${MANIFEST_PATH}"
+
+          echo "TAR_SIZE=${SIZE}" >> "$GITHUB_ENV"
+          echo "TAR_SHA=${SHA}" >> "$GITHUB_ENV"
+          cat "${MANIFEST_PATH}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            ${{ env.TAR_PATH }}
+            ${{ env.SHA_PATH }}
+            ${{ env.MANIFEST_PATH }}
+          if-no-files-found: error
+          # tar.gz 已经是压缩过的，再压一遍纯属浪费 CPU 和上传时间
+          compression-level: 0
+          retention-days: 30
+          # 手动重跑同一个 tag 时直接覆盖，否则 v4 会报 "artifact 已存在"
+          overwrite: true
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo "### simple-jev 镜像已打包为 artifact"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 镜像 | \`${IMAGE_REF:-?}\` |"
+            echo "| 平台 | \`${PLATFORM}\` |"
+            echo "| upstream ref | \`${INPUT_SIMPLE_JEV_REF}\` |"
+            echo "| artifact | \`${ARTIFACT_NAME:-?}\` |"
+            echo "| 大小 | ${TAR_SIZE:-?} bytes |"
+            echo "| sha256 | \`${TAR_SHA:-?}\` |"
+            echo ""
+            echo "在本次运行页面底部 **Artifacts** 区域下载，然后："
+            echo ""
+            echo '```bash'
+            echo "unzip ${ARTIFACT_NAME:-artifact}.zip -d image && cd image"
+            echo "sha256sum -c ${ARTIFACT_NAME:-artifact}.tar.gz.sha256"
+            echo "docker load -i ${ARTIFACT_NAME:-artifact}.tar.gz"
+            echo "docker run -d --name simple-jev --gpus all -p 8000:8000 \\"
+            echo "  -v /host/path/to/models:/models ${IMAGE_REF:-simple-jev:latest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
