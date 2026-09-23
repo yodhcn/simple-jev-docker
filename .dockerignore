@@ -1,7 +1,8 @@
-# This repository only ships the Dockerfile and the workflow: the simple-jev
-# source is cloned inside the image at build time. Keeping the build context to
-# just the Dockerfile makes every build upload a few kilobytes instead of the
-# whole working tree.
+# This repository ships only the image definition: the upstream kev source is
+# cloned inside the image at build time. Keeping the build context to the
+# Dockerfile plus the kev-serve shim makes every build upload a few kilobytes
+# instead of the whole working tree.
 **
 !Dockerfile
+!kev-serve
 !.dockerignore

@@ -1,21 +1,26 @@
-# simple-jev Docker 镜像（CUDA 12.4）
+# kev Docker 镜像
 
-把 [featherless-ai/simple-jev](https://github.com/featherless-ai/simple-jev) 打包成可直接运行的 Docker 镜像，
+把 [jaredpalmer/kev](https://github.com/jaredpalmer/kev) 打包成可直接运行的 Docker 镜像，
 由 GitHub Actions 在 Ubuntu runner 上构建，导出成 tar 后作为 **workflow artifact** 供你下载。
 
-这个仓库**只**包含镜像定义（`Dockerfile` + workflow），不含上游源码 —— 构建时会自动把上游仓库克隆进镜像。
+这个仓库**只**包含镜像定义（`Dockerfile` + `kev-serve` + workflow），不含上游源码 —— 构建时会自动把上游仓库克隆进镜像。
 镜像**不推送到任何镜像仓库**（GHCR、Docker Hub 都不用），CI 的产物就是那个 tar.gz。
+
+> kev 是一族基于 Qwen3.5 的小型决策模型（LoRA 适配器 + 指针头），对外提供与 TypeSafe
+> System One 兼容的 `/v1/systemone` 接口，可以回答 `noul`（是否）、`choice`（多选）、`score`（评分）三类问题。
 
 ## 镜像的定位
 
 | 项目 | 说明 |
 | --- | --- |
-| 🎯 目标环境 | **仅 GPU（CUDA 12.4）**，基于 `nvidia/cuda:12.4.1-runtime-ubuntu22.04`，不提供 CPU 版本 |
-| 🏗️ 目标架构 | **仅 `linux/amd64`**（原因见[关于 arm64](#关于-arm64)） |
-| ✅ 包含 | Python 3.12 + 独立 venv、PyTorch（cu124 构建）、Transformers / FastAPI 全量依赖、simple-jev 源码与 `simple-jev` 命令行入口 |
+| 🎯 目标环境 | **仅 GPU**，基镜像 `nvidia/cuda:12.4.1-runtime-ubuntu22.04`，不提供 CPU 版本 |
+| 🏗️ 目标架构 | **仅 `linux/amd64`** |
+| 🐍 Python | **3.13**（与上游 `.python-version` 一致），Ubuntu 22.04 自带 3.10，故经 deadsnakes PPA 安装 |
+| 📦 依赖 | 用 `uv sync --frozen` 按上游 **`uv.lock`** 安装，版本完全由锁文件决定 |
+| ✅ 包含 | Python 3.13 + uv 虚拟环境、PyTorch、Transformers / PEFT、FastAPI 服务端、kev 源码本体 |
 | ❌ 不包含 | **任何模型权重**。不预下载、不内置、不声明模型目录 |
 | 🚀 默认命令 | `tail -f /dev/null` —— 容器起来后只是空转保活，服务由你自己启动 |
-| 📦 端口 | 声明 `EXPOSE 8000`，是否映射由你决定 |
+| 📦 端口 | 声明 `EXPOSE 8009`，是否映射由你决定 |
 | 🔌 模型挂载 | 由你手动 `-v` 挂载，镜像不做任何预设 |
 
 ## 拿到镜像
@@ -24,77 +29,110 @@
 
 1. 仓库页面 → **Actions** → 左侧选 **`docker_image_build_artifact`** → **Run workflow**
 2. 按需填参数（见[工作流参数](#工作流参数)），然后运行
-3. 等构建完成（首次约 15–30 分钟），在该次运行页面底部 **Artifacts** 区域下载 `simple-jev-latest-amd64`
+3. 等构建完成（首次约 15–30 分钟），在该次运行页面底部 **Artifacts** 区域下载 `kev-latest-amd64`
 4. 解压后是三个文件：`.tar.gz`（镜像本体）、`.sha256`（校验和）、`.manifest.txt`（构建信息）
 
 ```bash
-unzip simple-jev-latest-amd64.zip -d image && cd image
+unzip kev-latest-amd64.zip -d image && cd image
 
 # 校验完整性
-sha256sum -c simple-jev-latest-amd64.tar.gz.sha256
+sha256sum -c kev-latest-amd64.tar.gz.sha256
 
-# 导入到本地 docker，得到 simple-jev:latest
-docker load -i simple-jev-latest-amd64.tar.gz
-docker images simple-jev
+# 导入到本地 docker，得到 kev:latest
+docker load -i kev-latest-amd64.tar.gz
+docker images kev
 ```
 
 > ⚠️ artifact 默认保留 **30 天**后自动删除。这个 tar 是镜像的唯一副本（没有镜像仓库兜底），
 > 建议下载后自己留存一份到服务器或对象存储。
 
-前置条件：宿主机装好 NVIDIA 驱动和 nvidia-container-toolkit，且驱动支持 CUDA 12.4
-（数据中心驱动 ≥ 470，消费级 Linux 驱动一般需 ≥ 525）。用 `nvidia-smi` 确认：
+前置条件：宿主机装好 NVIDIA 驱动和 nvidia-container-toolkit。驱动版本要求见
+[CUDA 版本与基镜像](#cuda-版本与基镜像) —— 简而言之**驱动 ≥ 525**。
 
 ```bash
-nvidia-smi                       # 右上角 "CUDA Version" 需 ≥ 12.4
-docker run --rm --gpus all simple-jev:latest nvidia-smi
+nvidia-smi                       # 确认驱动与 GPU 可见
+docker run --rm --gpus all kev:latest nvidia-smi
+```
+
+## 模型准备（重要）
+
+kev 的一个 checkpoint 是**一个目录**，里面至少要有：
+
+```
+head.pt                     # 元数据（含基座模型名、LoRA rank、温度等）+ 指针头权重
+adapter_config.json         # LoRA 配置
+adapter_model.safetensors   # LoRA 适配器权重
+tokenizer 相关文件
+```
+
+**关键点：checkpoint 里只存了基座模型的*名字*，不存基座权重。** `head.pt` 里的 `base` 字段指向
+`Qwen/Qwen3.5-4B-Base` 这类 Hub 仓库 ID，加载时由 transformers 经 Hugging Face 缓存去取。
+所以有两种用法：
+
+| 场景 | 做法 | 是否联网 |
+| --- | --- | --- |
+| 首次省事 | checkpoint 挂进容器，**基座走 HF 缓存**（`-v kev-hf-cache:/hf-cache`） | 首次需要联网下载基座 |
+| 完全离线 | 宿主机备好 HF 缓存目录，**整个挂进 `/hf-cache`**，再加 `-e HF_HUB_OFFLINE=1` | 不需要 |
+
+也可以直接把位置交给 HF 自己管：`--run jaredpalmer/kev-4b` 传 Hub 仓库 ID（支持
+`jaredpalmer/kev-4b@qwen3` 这种 `@revision` 写法），checkpoint 会下载到 `/hf-cache`。
+
+获取 checkpoint 的两种来源：Hugging Face 上的 `jaredpalmer/kev-0.8b` / `kev-4b` / `kev-9b`，
+或上游 [GitHub release](https://github.com/jaredpalmer/kev/releases/tag/kev-family) 的 tarball（带 SHA-256 校验和）。
+
+```bash
+# 把 checkpoint 放到宿主机上，比如 /data/kev-4b
+ls /data/kev-4b          # head.pt  adapter_config.json  adapter_model.safetensors  ...
 ```
 
 ## 快速开始
 
-以下命令里的镜像名统一用导入后得到的 `simple-jev:latest`。
+以下命令里的镜像名统一用导入后得到的 `kev:latest`。
 
 ### 1. 启动容器并保持空转
 
 ```bash
-docker run -d --name simple-jev --gpus all \
-  -p 8000:8000 \
-  -v /宿主机/模型目录:/models \
-  simple-jev:latest
+docker volume create kev-hf-cache
+
+docker run -d --name kev --gpus all \
+  -p 8009:8009 \
+  -v /data/kev-4b:/models/kev-4b \
+  -v kev-hf-cache:/hf-cache \
+  kev:latest
 ```
 
 此时容器内只有 `tail -f /dev/null` 在跑，模型和服务都没启动。
 
 ### 2. 自己启动服务
 
-**方式 A：进入容器启动（推荐）** —— 容器一直活着，服务可以随时停掉再起：
+用镜像里的 **`kev-serve`**（而不是 `python -m kev.serve`）：
 
 ```bash
-docker exec -it simple-jev simple-jev \
-  --model /models/Qwen3.5-0.8B \
-  --device cuda --dtype bfloat16 \
-  --host 0.0.0.0 --port 8000
+docker exec -it kev kev-serve --run /models/kev-4b --port 8009
 ```
 
 **方式 B：启动时直接替换命令** —— 不保留空转：
 
 ```bash
-docker run --rm --name simple-jev --gpus all -p 8000:8000 \
-  -v /宿主机/模型目录:/models \
-  simple-jev:latest \
-  simple-jev --model /models/Qwen3.5-0.8B --device cuda --dtype bfloat16 --host 0.0.0.0 --port 8000
+docker run --rm --name kev --gpus all -p 8009:8009 \
+  -v /data/kev-4b:/models/kev-4b \
+  -v kev-hf-cache:/hf-cache \
+  kev:latest \
+  kev-serve --run /models/kev-4b --port 8009
 ```
 
 **方式 C：docker compose**，用 `command:` 覆盖：
 
 ```yaml
 services:
-  simple-jev:
-    image: simple-jev:latest
-    container_name: simple-jev
+  kev:
+    image: kev:latest
+    container_name: kev
     ports:
-      - "8000:8000"
+      - "8009:8009"
     volumes:
-      - /宿主机/模型目录:/models
+      - /data/kev-4b:/models/kev-4b
+      - kev-hf-cache:/hf-cache
     deploy:
       resources:
         reservations:
@@ -102,50 +140,155 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
-    # command: ["tail", "-f", "/dev/null"]        # 只保活
-    command: ["simple-jev", "--model", "/models/Qwen3.5-0.8B", "--device", "cuda", "--dtype", "bfloat16", "--host", "0.0.0.0"]
+    # command: ["tail", "-f", "/dev/null"]           # 只保活
+    command: ["kev-serve", "--run", "/models/kev-4b", "--port", "8009"]
 ```
 
-> ⚠️ **必须显式传 `--host 0.0.0.0`**。上游服务的 `--host` 默认是 `127.0.0.1`，
-> 只监听容器回环地址时，宿主机的 `-p 8000:8000` 是访问不到的。
+> ⚠️ **`--run` 必须指向真实存在的目录。** 上游 `serve.py` 在路径不存在时会静默回退到
+> `--fallback`（默认 `runs/smoke`），而 `runs/smoke` 看起来像个 Hub 仓库 ID，
+> 于是报出一个"仓库不存在"的错误 —— 与实际原因（路径写错）完全无关。看到这类报错先检查挂载路径。
 
-服务就绪后可自检：
+### 3. 调用
+
+服务就绪后（加载权重期间不监听端口，首次可能要等一会儿）：
 
 ```bash
-curl http://localhost:8000/health
-curl http://localhost:8000/v1/classifier -H 'Content-Type: application/json' \
-  --data-binary '{"model":"/models/Qwen3.5-0.8B","state":"Mia owns a red bicycle.","questions":{"color":{"type":"choice","instructions":"What color is the bike?","criteria":{"red":null,"blue":null}}}}'
+curl -s localhost:8009/v1/models
+
+curl -s localhost:8009/v1/systemone -H 'content-type: application/json' -d '{
+  "state": "Shoes arrived two weeks late and in the wrong size. Also I see two charges on my card.",
+  "model": "kev-latest",
+  "questions": {
+    "department":  {"type": "choice", "instructions": "Which team should handle this?",
+                    "criteria": {"returns": "Exchanges, refunds, wrong or damaged items",
+                                 "shipping": "Delivery status, delays, lost packages",
+                                 "billing": "Charges, invoices, payment problems"}},
+    "escalate":    {"type": "noul",  "instructions": "Does this need urgent human attention?"},
+    "frustration": {"type": "score", "instructions": "How frustrated is the customer?",
+                    "criteria": ["Calm", "Frustrated", "Very angry"]}
+  }}'
 ```
 
-注意请求体里的 `model` 必须和启动时 `--model` 传的字符串完全一致。
+请求体里的 `model` 字段是**回显**用的，任意字符串都行（上游示例统一用 `kev-latest`）。
 
-### dtype 与显卡代际
+其他端点：
 
-上游 `--dtype` 默认 `bfloat16`，需要 **Ampere 及更新**的显卡（RTX 30 系 / A100 及以后）。
-更老的卡（如 V100、T4）请改用 `--dtype float16`：
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/v1/models` | 模型卡片 + 当前加载的 checkpoint、设备、dtype、温度、前缀缓存命中统计 |
+| `POST` | `/v1/systemone` | 主接口 |
+| `POST` | `/v1/systemone/permute` | 同一个 Choice 问题换多种选项顺序各跑一遍，看答案是否稳定 |
+| `POST` | `/v1/systemone/separate` | 每个问题各跑一次前向（用于对比"打包提问 vs 分开提问"） |
 
-```bash
-docker exec -it simple-jev simple-jev --model /models/Qwen3.5-0.8B --device cuda --dtype float16 --host 0.0.0.0
+## 为什么是 `kev-serve` 而不是 `python -m kev.serve`
+
+上游 `kev/serve.py` 最后一行是：
+
+```python
+uvicorn.run(app, host="127.0.0.1", port=a.port)
 ```
 
-## 挂载模型
+**host 是硬编码的 `127.0.0.1`，而且 argparse 只暴露了 `--run` / `--fallback` / `--port`，没有 `--host`。**
+在笔记本上没问题，但在容器里这意味着服务只监听回环地址，Docker 的 `-p 8009:8009` 是 DNAT 到容器的
+eth0 地址上的，永远打不通 —— 而且**两端都不报错**，属于静默失败。
 
-镜像里没有模型，三种用法任选：
+镜像里的 `kev-serve` 是对上游启动流程的最小包装：除了把 bind 地址从环境变量取以外，
+其它什么都不改（设备选择、`LoadOptions.from_env`、CUDA 上用 bf16 的默认值全部沿用上游）。
+它通过在 `kev.serve.main()` 之前替换 `uvicorn.run` 实现，而不是复制一份 `main()` —— 复制会随着上游改动悄悄腐烂。
 
-| 场景 | 做法 |
-| --- | --- |
-| 本地已有模型目录 | `-v /host/model:/models`，然后 `--model /models/<名称>` |
-| 用 Hugging Face 仓库名 | `-v hf-cache:/hf-cache`，然后 `--model Qwen/Qwen3.5-0.8B`（会联网下载到 `/hf-cache`） |
-| 完全离线 | 先把权重放进 `/hf-cache` 卷，再加 `-e HF_HUB_OFFLINE=1` |
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `KEV_HOST` | `0.0.0.0` | bind 地址。设成空字符串则退回上游的 `127.0.0.1`；设成具体网卡地址可收窄暴露面 |
+| `KEV_PORT` | 未设置 | 设置后优先于 `--port`，方便 compose / `.env` 管理 |
 
-镜像内 `HF_HOME` 已固定为 `/hf-cache`，挂个卷上去就能让权重跨容器重启复用：
+**不想用这个包装层的话**，也可以让上游原样跑，代价是要放弃端口映射、改用 host 网络：
 
 ```bash
-docker volume create hf-cache
-docker run -d --name simple-jev --gpus all -p 8000:8000 \
-  -v /宿主机/模型目录:/models \
-  -v hf-cache:/hf-cache \
-  simple-jev:latest
+docker run --rm --network host --gpus all \
+  -v /data/kev-4b:/models/kev-4b -v kev-hf-cache:/hf-cache \
+  kev:latest \
+  python -m kev.serve --run /models/kev-4b --port 8009
+# --network host 下容器内的 127.0.0.1 就是宿主机回环，所以能访问，但端口隔离也没了
+```
+
+反过来说，只想临时验证 shim 没加私货：`docker exec -it kev python -m kev.serve --help`。
+
+## 常用环境变量
+
+除了上面的 `KEV_HOST` / `KEV_PORT`，上游还认这些（都是运行时 `-e` 传）：
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `KEV_DTYPE` | CUDA 上 `bf16` | `bf16` / `fp16` / `fp32`。`fp32` 是上游所有已公布数字所用的"精确路径"，更慢但更可复现 |
+| `KEV_MERGE` | `1` | 是否把 LoRA 合进基座权重。`0` 关闭 |
+| `KEV_ATTN` | 模型默认 | 注意力后端，如 `sdpa` / `eager` |
+| `KEV_LORA_SCALE` | `1` | WiSE-FT 式插值，在基座（0）与微调权重（1）之间 |
+| `KEV_TEMPERATURE` | checkpoint 自带 | `1.0` = 原始 logits，不做校准 |
+| `KEV_BACKEND` | `torch` | `torch` / `mlx` / `auto`（MLX 是 Apple Silicon 专用，容器里用不上） |
+| `KEV_DATE_FACTS` | `0` | `1` 则在文本里追加日期差（kev 自己算不准日期，但能用现成的天数） |
+| `KEV_API_KEY` | 未设置 | 设置后 `/v1/*` 要求 `Authorization: Bearer <key>` |
+| `KEV_PREFIX_CACHE` | `4` | 状态前缀缓存条数，`0` 关闭 |
+| `KEV_PREFIX_MIN_TOKENS` | `384` | 状态短于该值时不做前缀分离 |
+| `HF_HOME` | `/hf-cache` | 权重缓存位置（镜像内已固定，挂卷即可复用） |
+| `HF_HUB_OFFLINE` | 未设置 | `1` 强制离线，权重必须已在缓存里 |
+
+## CUDA 版本与基镜像
+
+这里有个容易误解的点，值得单独说明：**基镜像上的 `12.4` 并不代表 torch 实际跑的 CUDA。**
+
+上游的 `uv.lock` 把 torch 解析成 **PyPI 上的 2.8.0**（不是 PyTorch 官方 CUDA 索引里的变体）。
+PyPI 的 Linux torch wheel 会**自带一整套 CUDA 用户态库**（以 `nvidia-*-cu12` 依赖的形式，
+锁文件里能看到 `nvidia-cuda-runtime-cu12` 等），torch 运行时优先加载的就是这一套，
+而不是基镜像里的 CUDA。所以基镜像在这里主要提供 CUDA 的工具链布局和驱动挂载点。
+
+实际约束落在**宿主机驱动**上：CUDA 12.x 的次版本兼容规则允许 12.8 的用户态库跑在
+**驱动 ≥ 525** 上。想要 CUDA 12.8 的完整特性则建议驱动 ≥ 570。
+
+如果你更希望基镜像和 torch 的 CUDA 版本严格一致，把基镜像换成 12.8 即可（改一处）：
+
+```dockerfile
+ARG BASE_IMAGE=nvidia/cuda:12.8.1-runtime-ubuntu22.04
+```
+
+**为什么不用 PyTorch 官方的 cuXXX 索引**：`uv sync --frozen` 完全按 `uv.lock` 安装，
+而锁文件里记录的就是 PyPI 的 wheel 及其哈希。换索引等于绕开锁文件重新解析，
+会同时丢掉版本可复现性和哈希校验 —— 为了对齐一个本身不参与运算的版本号，不划算。
+
+## flash-linear-attention
+
+Qwen3.5 的骨干混了 Gated DeltaNet 层。`transformers` 在这几层上用的是
+[flash-linear-attention](https://github.com/fla-org/flash-linear-attention) 的 Triton 内核，
+取用方式是在建模代码里挂装饰器 `use_kernel_func_from_hub_with_fallback("chunk_gated_delta_rule", "fla")`
+（已对着 pinned 的 transformers 5.17.0 源码核实）。它会 `import fla`，再解析
+`fla.ops.gated_delta_rule.chunk_gated_delta_rule`；**解析不到时不抛异常**，只打一条 warning
+然后退回参考 PyTorch 实现 —— 官方注释原话是 "This is correct but much slower"，量级差一个数量级。
+
+所以这里要分清两件事：**装了**（`import fla` 成功）和**生效了**（那个符号真的解析到）。
+`Dockerfile` 的构建期自检断的是后者，因为前者在出错的那个场景里照样通过。
+
+它不在 `uv.lock` 里，由 `Dockerfile` 单独 `uv pip install`，**按上游自己的 Modal 配方装不带 extra 的包名**：
+
+- `flash-linear-attention`（bare）的依赖只有 `fla-core` + `einops` + `transformers>=4.45`，
+  都不带 torch / triton 约束，所以这一步**不可能把 torch 或 triton 拉出 `uv.lock`**
+- 早先写的 `flash-linear-attention[cuda]` 会额外引入 `torch>=2.7` / `triton>=3.3`。这些约束今天是被满足的，
+  但留着等于给未来某个 fla 版本一个改 torch 的机会，因此改回 bare
+- `einops` 是这一步唯一一个 `uv.lock` 里没有的包（`fla-core` 无条件依赖它）
+
+> **和上游 Modal 镜像的两处有意差异**
+>
+> 1. **triton 保持锁里的 3.4.0。** 上游额外强制 `triton>=3.7.1`，只为绕开 gated-chunk 的
+>    **反向传播** bug（fla#640）。本镜像只跑前向推理，不需要这个 workaround，也就不去动锁里的 pin。
+> 2. **不装 `causal-conv1d`**（上游也没装），所以短卷积退回 `F.conv1d`。相对 delta-rule 内核本身，
+>    这是次要开销。
+
+不想要它的话，构建时传 `--build-arg INSTALL_FLASH_LINEAR_ATTENTION=0`（workflow 里对应 `flash_linear_attention` 开关）。
+需要两次构建完全一致时，用 `--build-arg FLASH_LINEAR_ATTENTION_SPEC=flash-linear-attention==0.5.2` 把它也钉住
+（默认不钉，与上游一致）。
+
+确认运行中的容器里内核确实生效（输出应以 `fla.` 开头；若报 ImportError，说明装的那份没解析到）：
+
+```bash
+docker exec kev python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule as f; print(f.__module__)"
 ```
 
 ## GitHub Actions 工作流
@@ -159,39 +302,39 @@ docker run -d --name simple-jev --gpus all -p 8000:8000 \
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
-| `image_tag` | `latest` | 给镜像打的 tag，决定 tar 里的镜像名 `simple-jev:<tag>` |
-| `simple_jev_ref` | `main` | 上游 simple-jev 的 ref：分支 / tag / commit SHA。要可复现的镜像就固定成 tag 或 SHA |
-| `torch_version` | 空 | 指定 PyTorch 版本（例如 `2.6.0`）。空 = cu124 索引上的最新版 |
-| `simple_jev_extras` | 空 | 上游 hf-server 的可选依赖，例如 `laya` |
-| `cleanup` | `true` | 构建前清理 runner 磁盘。镜像约 7 GB，而 hosted runner 默认只剩 ~14 GB 可用，**建议保持开启** |
+| `image_tag` | `latest` | 给镜像打的 tag，决定 tar 里的镜像名 `kev:<tag>` |
+| `kev_ref` | `main` | 上游 kev 的 ref：分支 / tag / commit SHA。要可复现的镜像就固定成 tag 或 SHA |
+| `flash_linear_attention` | `true` | 是否安装 Gated DeltaNet 内核（见上一节） |
+| `cleanup` | `true` | 构建前清理 runner 磁盘。hosted runner 默认空间紧张，**建议保持开启** |
 
-构建参数 `BASE_IMAGE` 和 `TORCH_INDEX_URL` 由 `Dockerfile` 决定，workflow 不再重复传，
-避免两处漂移；要改 CUDA / PyTorch 版本直接改 `Dockerfile` 的 `ARG` 默认值。
+基镜像、Python 版本、uv 版本、依赖版本都由 `Dockerfile` / `uv.lock` 决定，workflow 不再重复传，
+避免两处漂移。
 
 产物：
 
-- artifact 名 `simple-jev-<tag>-amd64`，内含 `.tar.gz` + `.sha256` + `.manifest.txt`
-- `.manifest.txt` 里记了镜像 ID、大小、tar 的 sha256、内嵌的 torch / CUDA 版本、上游 ref 和产生它的那次 run，方便日后追溯
+- artifact 名 `kev-<tag>-amd64`，内含 `.tar.gz` + `.sha256` + `.manifest.txt`
+- `.manifest.txt` 里记了镜像 ID、大小、tar 的 sha256、镜像内实际的 Python / torch / CUDA 版本、上游 ref
+  和产生它的那次 run，方便日后追溯
 - 上传时用 `compression-level: 0`（tar.gz 已经压过一遍，再压纯属浪费 CPU 和上传时间）
 - 保留 30 天，同一 tag 重跑会直接覆盖旧 artifact
 
-构建使用 Buildx + GitHub Actions 缓存（`type=gha`），CUDA / PyTorch 那两层能被缓存住，
-重复构建省掉约 5 GB 下载。注意 Actions 缓存每个仓库上限 10 GB，镜像偏大时缓存可能被挤掉，属正常现象。
+构建使用 Buildx + GitHub Actions 缓存（`type=gha`），CUDA / torch 那两层能被缓存住，重复构建省掉数 GB 下载。
+注意 Actions 缓存每个仓库上限 10 GB，镜像偏大时缓存可能被挤掉，属正常现象。
 
 ## 本地构建
 
-没有 CI 或者想快速试错时可以本地构建（本仓库的 `.dockerignore` 只放行 `Dockerfile`，
+没有 CI 或者想快速试错时可以本地构建（`.dockerignore` 只放行 `Dockerfile` 和 `kev-serve`，
 构建上下文只有几 KB，因为上游源码是在镜像里 clone 的）：
 
 ```bash
-# 默认：CUDA 12.4 + torch cu124
-docker build -t simple-jev:local .
+# 默认：CUDA 12.4 基镜像 + 上游 uv.lock
+docker build -t kev:local .
 
 # 固定上游版本，构建可复现的镜像
-docker build --build-arg SIMPLE_JEV_REF=v0.1.0 -t simple-jev:v0.1.0 .
+docker build --build-arg KEV_REF=kev-family -t kev:kev-family .
 
 # 构建完自己导出成同样的 tar（和 CI 的产物格式一致）
-docker save simple-jev:v0.1.0 | pigz > simple-jev-v0.1.0.tar.gz
+docker save kev:local | pigz > kev-local.tar.gz
 ```
 
 ### 构建参数
@@ -199,48 +342,31 @@ docker save simple-jev:v0.1.0 | pigz > simple-jev-v0.1.0.tar.gz
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `BASE_IMAGE` | `nvidia/cuda:12.4.1-runtime-ubuntu22.04` | CUDA 基镜像。CUDA 12.4 **没有** ubuntu24.04 版本（官方从 12.5.1 才开始支持），所以是 22.04 |
-| `PYTHON_VERSION` | `3.12` | Ubuntu 22.04 自带 3.10，低于上游 `requires-python >=3.12`，因此经 deadsnakes PPA 安装 3.12 |
-| `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu124` | PyTorch 的 wheel 索引，需与 `BASE_IMAGE` 的 CUDA 版本一致 |
-| `TORCH_VERSION` | 空 | 指定 PyTorch 版本，例如 `2.6.0`。空 = 该索引上的最新版 |
-| `SIMPLE_JEV_REPO` | `https://github.com/featherless-ai/simple-jev.git` | 上游仓库地址 |
-| `SIMPLE_JEV_REF` | `main` | 分支 / tag / commit SHA，可固定版本 |
-| `SIMPLE_JEV_EXTRAS` | 空 | 可选依赖，例如 `laya` |
-
-> 📌 **cu124 索引上 PyTorch 最高只到 2.6.0**（正好等于上游 `torch>=2.6` 的下限）。
-> 想要更新的 PyTorch，必须同时换掉基镜像和索引，例如
-> `--build-arg BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-runtime-ubuntu24.04 --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu126`
-> —— 这两项必须成对修改，否则框架里的 CUDA 运行时会和基镜像不一致。
-> 镜像构建期有一条断言 `torch.version.cuda == '12.4'`，装错版本会直接构建失败而不是静默出货。
-
-## 关于 arm64
-
-当前 workflow 锁死 `linux/amd64`，不是偷懒，是这条技术栈在 arm64 上确实走不通：
-
-1. **cu124 索引没有满足 `torch>=2.6` 的 arm64 wheel。** 该索引上 aarch64 的包只到 2.5.x，
-   而 2.6.0 只有 `linux_x86_64` / `win_amd64`；上游要求 `torch>=2.6`，pip 会直接解析失败。
-2. CUDA 12.4 的官方镜像也没有 Ubuntu 24.04 版本（Ubuntu 系只有 20.04 / 22.04）。
-
-真需要 arm64 的话，要一次性改三处：
-
-| 位置 | 改成 |
-| --- | --- |
-| `Dockerfile` 的 `BASE_IMAGE` | 换到有 arm64 标签的 CUDA 镜像（12.5.1 起才提供 ubuntu24.04，arm64 标签需自行到 Docker Hub 确认） |
-| `Dockerfile` 的 `TORCH_INDEX_URL` | `https://download.pytorch.org/whl/cu126` —— 该索引上有 `torch-2.6.0+cu126-cp312-cp312-linux_aarch64.whl` |
-| `Dockerfile` 的构建期断言 | `torch.version.cuda == '12.4'` 要跟着改成 `'12.6'` |
-| workflow 的 `runs-on` / `PLATFORM` | `ubuntu-24.04-arm`（**仅公共仓库免费**）+ `linux/arm64` |
+| `PYTHON_VERSION` | `3.13` | 与上游 `.python-version` 一致。Ubuntu 22.04 自带 3.10，因此经 deadsnakes PPA 安装 |
+| `UV_VERSION` | `0.12.18` | 读 `uv.lock` 的工具版本 |
+| `KEV_REPO` | `https://github.com/jaredpalmer/kev.git` | 上游仓库地址 |
+| `KEV_REF` | `main` | 分支 / tag / commit SHA，可固定版本 |
+| `INSTALL_FLASH_LINEAR_ATTENTION` | `1` | 是否安装 DeltaNet 内核 |
+| `FLASH_LINEAR_ATTENTION_SPEC` | `flash-linear-attention` | 上一项具体装什么。默认不钉版本（与上游一致），钉住才能让两次构建完全一致 |
 
 ## 说明与限制
 
-- **仅 GPU / CUDA 12.4**：不提供 CPU 版本。CUDA 12.4 的镜像是 amd64 only。
+- **仅 GPU**：不提供 CPU 版本。
 - **不推送镜像仓库**：CI 的产物只有 artifact，仓库里没有镜像副本，所以 artifact 过期前记得下载留存。
+- **不内置模型**：镜像里没有任何权重，checkpoint 和基座都靠 `-v` 挂载或 HF 缓存。
+- **驱动要求**：≥ 525（torch 自带的 CUDA 用户态库是 12.8，受 CUDA 12.x 次版本兼容规则约束）。
+- **`kev-serve` 是本仓库唯一对上游的改动**，只为改 bind 地址；上游源码本身未被修改。
 - **ENTRYPOINT 已清空**：NVIDIA 基镜像自带 `/opt/nvidia/nvidia_entrypoint.sh`，本镜像用 `ENTRYPOINT []` 清掉了，
-  这样 `docker run <镜像> <你的命令>` 能干净地整体替换默认命令（同理 `docker exec` 时 `simple-jev` 直接可用）。
+  这样 `docker run <镜像> <你的命令>` 能干净地整体替换默认命令。
 - **`LD_LIBRARY_PATH` 保持基镜像的默认值**，没有覆盖 —— 覆盖会导致容器内找不到 CUDA 库。
-- **镜像体积**：CUDA runtime 基镜像 + cu124 版 PyTorch，`docker save` 出的 tar 未压缩约 7 GB 量级，
-  压缩后约 3 GB；所以 workflow 里会先 gzip 再上传。
-- **单 artifact 上限 10 GB**：这是 GitHub 的硬限制、不可调，因此镜像必须压缩后再传。
+- **镜像体积**：CUDA 基镜像 + 自带 CUDA 库的 torch wheel + 构建工具链，`docker save` 出的 tar 未压缩约 8 GB 量级，
+  压缩后约 3–4 GB。**单 artifact 上限 10 GB** 是 GitHub 的硬限制、不可调，因此镜像必须压缩后再传 ——
+  如果哪天镜像涨到压完还超过 10 GB，就得先把 `BASE_IMAGE` 换成更瘦的变体，或改用镜像仓库。
+- **`build-essential` 装在镜像里**：`uv.lock` 同时记录 wheel 和 sdist，万一某个包没有 cp313/linux 的 wheel，
+  uv 需要现场编译。这是为了构建可靠性做的取舍，代价约 250 MB。
+- **串行推理**：上游服务一次只处理一个请求，靠状态前缀缓存加速重复文本，但不会对不同调用方做批处理。
 - **运行用户**：容器内以 root 运行，方便直接写挂载目录和访问 GPU。
-- **无 HEALTHCHECK**：默认命令是 `tail`，容器探活会失败，所以没有配置探活；真正启动服务后可自行 `curl /health`。
+- **无 HEALTHCHECK**：默认命令是 `tail`，容器探活会失败，所以没有配置探活；真正启动服务后可自行 `curl /v1/models`。
 - **无 VOLUME 声明**：避免 Docker 自动创建匿名卷，模型路径完全由你自己的 `-v` 决定。
-- **首次启动很慢是正常的**：加载大模型权重需要时间，服务在权重加载完成后才开始监听。
+- **首次启动很慢是正常的**：要先下载（或从缓存加载）基座模型，再套 LoRA 和指针头，期间不监听端口。
 - 本仓库不跟踪上游代码变化，上游更新后需重新构建镜像（手动触发 workflow 即可）。

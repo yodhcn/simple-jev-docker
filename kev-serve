@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Start kev.serve with a configurable bind address.
+
+Upstream `kev/serve.py` ends with `uvicorn.run(app, host="127.0.0.1", port=a.port)`:
+the host is hardcoded and argparse only takes `--run`, `--fallback` and `--port`.
+That is fine on a laptop, but inside a container the server then listens on the
+loopback interface only, so Docker's `-p 8009:8009` DNATs to the container's
+eth0 address and never reaches it -- a silent failure with no error on either
+side.
+
+This shim leaves upstream's whole startup path untouched (device pick,
+LoadOptions.from_env, the bf16 default on CUDA) and overrides exactly one value:
+
+    KEV_HOST   bind address. Defaults to 0.0.0.0, which is what a container
+               needs. Set it to an empty string to fall back to upstream's
+               127.0.0.1, or to a specific interface to narrow the exposure.
+    KEV_PORT   optional. When set it wins over --port, which is handy in a
+               compose/`.env` workflow.
+
+Use it exactly like upstream's `python -m kev.serve`, with the same arguments:
+
+    kev-serve --run /models/kev-4b --port 8009
+
+Why a monkeypatch instead of reimplementing main(): every other line of that
+function is upstream's business, and duplicating it would silently rot the next
+time upstream changes how a checkpoint is loaded. Patching `uvicorn.run` before
+`main()` imports it is the smallest possible surface -- `main()` does
+`import uvicorn` lazily, and that resolves to the same module object patched
+here, so its call site picks up the wrapper.
+"""
+import os
+
+import uvicorn
+
+import kev.serve
+
+HOST = os.environ.get("KEV_HOST", "0.0.0.0")
+PORT = os.environ.get("KEV_PORT")
+
+_upstream_run = uvicorn.run
+
+
+def _run(app, host="127.0.0.1", port=8008, **kwargs):
+    if PORT:
+        port = int(PORT)
+    return _upstream_run(app, host=HOST or host, port=port, **kwargs)
+
+
+uvicorn.run = _run
+kev.serve.main()
