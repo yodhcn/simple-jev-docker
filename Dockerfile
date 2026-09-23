@@ -29,6 +29,11 @@
 #   # ...then start the server inside the running container:
 #   docker exec -it kev kev-serve --run /models/kev-4b --port 8009
 #
+#   # To serve a base you have on disk instead of the Hugging Face cache, mount it
+#   # and name it (see README「模型准备」):
+#   docker exec -it kev kev-serve --run /models/kev-4b --port 8009 \
+#     --base-model /models/qwen3.5-4b-base
+#
 # Upstream: https://github.com/jaredpalmer/kev
 # ---------------------------------------------------------------------------
 
@@ -82,8 +87,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # The one wrapper this repository adds to upstream. kev/serve.py hardcodes
 # uvicorn's bind host to 127.0.0.1 and exposes no --host flag, which would make
-# a `-p 8009:8009` container unreachable; the shim only overrides that one
-# value. See the file itself for the details.
+# a `-p 8009:8009` container unreachable; it also offers no way to point a
+# checkpoint at a base other than the one its head.pt names. The shim overrides
+# exactly those two things and nothing else. See the file itself for the details.
 COPY kev-serve /usr/local/bin/kev-serve
 RUN chmod +x /usr/local/bin/kev-serve
 

@@ -1,41 +1,142 @@
 #!/usr/bin/env python3
-"""Start kev.serve with a configurable bind address.
+"""Start kev.serve with a configurable bind address and an overridable base model.
 
-Upstream `kev/serve.py` ends with `uvicorn.run(app, host="127.0.0.1", port=a.port)`:
-the host is hardcoded and argparse only takes `--run`, `--fallback` and `--port`.
-That is fine on a laptop, but inside a container the server then listens on the
-loopback interface only, so Docker's `-p 8009:8009` DNATs to the container's
-eth0 address and never reaches it -- a silent failure with no error on either
-side.
+Two things upstream's `python -m kev.serve` cannot do inside a container, both
+fixed here without touching upstream:
 
-This shim leaves upstream's whole startup path untouched (device pick,
-LoadOptions.from_env, the bf16 default on CUDA) and overrides exactly one value:
+1. BIND ADDRESS. `kev/serve.py` ends with `uvicorn.run(app, host="127.0.0.1",
+   port=a.port)`: the host is hardcoded and argparse only takes `--run`,
+   `--fallback` and `--port`. That is fine on a laptop, but inside a container
+   the server then listens on the loopback interface only, so Docker's
+   `-p 8009:8009` DNATs to the container's eth0 address and never reaches it --
+   a silent failure with no error on either side.
 
-    KEV_HOST   bind address. Defaults to 0.0.0.0, which is what a container
-               needs. Set it to an empty string to fall back to upstream's
-               127.0.0.1, or to a specific interface to narrow the exposure.
-    KEV_PORT   optional. When set it wins over --port, which is handy in a
-               compose/`.env` workflow.
+       KEV_HOST   bind address. Defaults to 0.0.0.0, which is what a container
+                  needs. Set it to an empty string to fall back to upstream's
+                  127.0.0.1, or to a specific interface to narrow the exposure.
+       KEV_PORT   optional. When set it wins over --port, which is handy in a
+                  compose/`.env` workflow.
+
+2. WHERE THE BASE MODEL COMES FROM. A kev checkpoint stores only the *name* of
+   its backbone: `head.pt` carries `base = "Qwen/Qwen3.5-4B-Base"` and
+   `base_revision = "<40-hex sha>"`, and `kev.checkpoint` then resolves both
+   through the Hugging Face cache (checkpoint.py: `load_tokenizer(meta.base,
+   revision=meta.base_revision)` and `DecisionModel(meta.base, ..., revision=...)`).
+   Nothing is hardcoded in kev itself -- the value is whatever the checkpoint was
+   trained against. To serve a base you already have on disk, or a mirror, or the
+   same base at a different revision, override it:
+
+       --base-model PATH_OR_REPO_ID     e.g. /models/qwen3.5-4b-base, or a Hub id
+       --base-revision REV              a branch, tag or commit SHA; "" unpins
+                                        (use the repo's default revision)
+
+   Environment equivalents: KEV_BASE_MODEL, KEV_BASE_REVISION (the CLI wins).
+   Unset means "keep whatever the checkpoint declares", i.e. upstream's behaviour.
+
+   Note the local-path rule: when `--base-model` points at an existing directory
+   and no `--base-revision` was given, the revision is forced to None. A Hub
+   revision is meaningless for a local snapshot, and leaving the checkpoint's sha
+   in place would ask transformers to apply it to a path that has no revisions.
+
+Everything else is upstream's: device pick, LoadOptions.from_env, the bf16
+default on CUDA, the whole arg surface of `kev.serve`. The shim only overrides
+the bind address and the two `Meta` fields above. Why a monkeypatch instead of
+reimplementing `main()` or copying `Checkpoint`: every other line of those is
+upstream's business, and duplicating any of it would silently rot the next time
+upstream changes how a checkpoint is loaded.
 
 Use it exactly like upstream's `python -m kev.serve`, with the same arguments:
 
     kev-serve --run /models/kev-4b --port 8009
-
-Why a monkeypatch instead of reimplementing main(): every other line of that
-function is upstream's business, and duplicating it would silently rot the next
-time upstream changes how a checkpoint is loaded. Patching `uvicorn.run` before
-`main()` imports it is the smallest possible surface -- `main()` does
-`import uvicorn` lazily, and that resolves to the same module object patched
-here, so its call site picks up the wrapper.
+    kev-serve --run /models/kev-4b --port 8009 --base-model /models/qwen3.5-4b-base
 """
+import argparse
 import os
+import sys
 
 import uvicorn
 
+import kev.checkpoint
 import kev.serve
 
 HOST = os.environ.get("KEV_HOST", "0.0.0.0")
 PORT = os.environ.get("KEV_PORT")
+
+
+def _own_args(argv):
+    """Split our two flags out of argv, leaving the rest for upstream's parser.
+
+    `add_help=False` + `allow_abbrev=False` matter here: upstream owns `--help`
+    (and `--base` must not be silently accepted as a prefix of `--base-model`).
+    Anything we do not recognise stays in `rest` and reaches `kev.serve.main()`
+    untouched, so upstream's own `--run` / `--fallback` / `--port` still work and
+    an unknown flag still fails in upstream's parser rather than ours."""
+    ap = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    ap.add_argument("--base-model", metavar="PATH_OR_REPO_ID")
+    ap.add_argument("--base-revision", metavar="REV")
+    known, rest = ap.parse_known_args(argv)
+    return known, rest
+
+
+def _override(name, cli_value, env_var):
+    """CLI wins over the environment. None = the caller said nothing."""
+    if cli_value is not None:
+        return cli_value
+    if env_var in os.environ:
+        return os.environ[env_var]
+    return None
+
+
+def _install_base_override(model, revision):
+    """Patch `Meta` on every Checkpoint right after `head.pt` is read.
+
+    Patching `Checkpoint.__init__` rather than `load` covers every reader of the
+    field in one place: `load` (tokenizer + DecisionModel), `hybrid_base`
+    (AutoConfig, which picks the MLX backend) and the `/v1/models` card, which
+    reports `base` back to the client -- that is also how you confirm the
+    override took effect."""
+    original_init = kev.checkpoint.Checkpoint.__init__
+
+    def patched_init(self, run):
+        original_init(self, run)
+        meta = self.meta
+        before = f"{meta.base}@{meta.base_revision or '(unpinned)'}"
+        if model:
+            meta.base = model
+            # Only when the caller pinned nothing: a local directory has no
+            # revisions, so the checkpoint's sha would be meaningless there.
+            if revision is None and os.path.isdir(model):
+                meta.base_revision = None
+        if revision is not None:
+            meta.base_revision = revision or None   # "" = unpin, use the default revision
+        after = f"{meta.base}@{meta.base_revision or '(unpinned)'}"
+        if after != before:
+            print(f"kev-serve: base model {before} -> {after}", flush=True)
+
+    kev.checkpoint.Checkpoint.__init__ = patched_init
+
+
+known, rest = _own_args(sys.argv[1:])
+sys.argv = sys.argv[:1] + rest          # upstream must not see our flags
+
+# upstream owns --help, so its parser prints its own options and exits. Ours are
+# invisible there, which makes them undiscoverable in a container; prepend them.
+if any(a in ("-h", "--help") for a in rest):
+    print(
+        "kev-serve overrides (all optional; unset = upstream behaviour):\n"
+        "  --base-model PATH_OR_REPO_ID   base to load instead of the one the checkpoint names\n"
+        "  --base-revision REV            branch/tag/SHA for it; \"\" unpins\n"
+        "  KEV_BASE_MODEL / KEV_BASE_REVISION   environment equivalents (the flags win)\n"
+        "  KEV_HOST (default 0.0.0.0)     bind address, so -p reaches the server in a container\n"
+        "  KEV_PORT                       wins over --port\n"
+        "upstream's options follow.\n",
+        flush=True,
+    )
+
+_base_model = _override("--base-model", known.base_model, "KEV_BASE_MODEL")
+_base_revision = _override("--base-revision", known.base_revision, "KEV_BASE_REVISION")
+if _base_model or _base_revision is not None:
+    _install_base_override(_base_model, _base_revision)
 
 _upstream_run = uvicorn.run
 

@@ -65,16 +65,45 @@ adapter_model.safetensors   # LoRA 适配器权重
 tokenizer 相关文件
 ```
 
-**关键点：checkpoint 里只存了基座模型的*名字*，不存基座权重。** `head.pt` 里的 `base` 字段指向
-`Qwen/Qwen3.5-4B-Base` 这类 Hub 仓库 ID，加载时由 transformers 经 Hugging Face 缓存去取。
-所以有两种用法：
+**关键点：checkpoint 里只存了基座模型的*名字*，不存基座权重。** `head.pt` 里的 `base` / `base_revision`
+两个字段声明了它训练时用的基座 —— 以 `jaredpalmer/kev-4b` 为例（解开该文件实测）：
+
+| 字段 | 值 |
+| --- | --- |
+| `base` | `Qwen/Qwen3.5-4B-Base` |
+| `base_revision` | `1001bb4d826a52d1f399e183466143f4da7b741b` |
+
+`kev/checkpoint.py` 读出这两个字段后交给 transformers，经 Hugging Face 缓存解析
+（`load_tokenizer(meta.base, revision=meta.base_revision)` 和 `DecisionModel(meta.base, ..., revision=...)`）。
+**上游代码里并没有写死这个模型名** —— 值是 checkpoint 自己带的，`kev/transfer_v9.py:35` 里那份
+`Qwen/Qwen3.5-4B-Base → 1001bb4d` 的映射只服务于评测数据生成，评测/训练命令（`README.md:264`）里那个
+`--base_revision` 也是训练参数，服务路径都不经过它们。
+
+所以有三种用法：
 
 | 场景 | 做法 | 是否联网 |
 | --- | --- | --- |
 | 首次省事 | checkpoint 挂进容器，**基座走 HF 缓存**（`-v kev-hf-cache:/hf-cache`） | 首次需要联网下载基座 |
 | 完全离线 | 宿主机备好 HF 缓存目录，**整个挂进 `/hf-cache`**，再加 `-e HF_HUB_OFFLINE=1` | 不需要 |
+| 基座自己指定 | 基座权重放宿主机目录，挂进来并用 **`--base-model` 覆盖**（见下） | 不需要 |
 
-也可以直接把位置交给 HF 自己管：`--run jaredpalmer/kev-4b` 传 Hub 仓库 ID（支持
+第三种才是「模型路径从外部挂载」的完整形态 —— 连基座也不经过 HF 缓存：
+
+```bash
+docker run -d --name kev --gpus all \
+  -p 8009:8009 \
+  -v /data/kev-4b:/models/kev-4b \
+  -v /data/qwen3.5-4b-base:/models/qwen3.5-4b-base \
+  kev:latest \
+  kev-serve --run /models/kev-4b --port 8009 \
+            --base-model /models/qwen3.5-4b-base
+```
+
+`--base-model` 既接受**本地目录**也接受 **Hub 仓库 ID**（`--base-revision` 可进一步钉住分支/tag/SHA）。
+指向本地目录时会自动把 `base_revision` 置空 —— revision 只对 Hub 仓库有意义，本地快照上留着 checkpoint
+那个 sha 只是把一个无意义的参数递给 transformers。
+
+也可以把 checkpoint 的位置交给 HF 自己管：`--run jaredpalmer/kev-4b` 传 Hub 仓库 ID（支持
 `jaredpalmer/kev-4b@qwen3` 这种 `@revision` 写法），checkpoint 会下载到 `/hf-cache`。
 
 获取 checkpoint 的两种来源：Hugging Face 上的 `jaredpalmer/kev-0.8b` / `kev-4b` / `kev-9b`，
@@ -120,6 +149,9 @@ docker run --rm --name kev --gpus all -p 8009:8009 \
   kev:latest \
   kev-serve --run /models/kev-4b --port 8009
 ```
+
+要连基座也完全走本地挂载，就在末尾追加 `--base-model /models/qwen3.5-4b-base` 并多挂一个卷，
+完整命令见上一节「模型准备」。
 
 **方式 C：docker compose**，用 `command:` 覆盖：
 
@@ -180,7 +212,12 @@ curl -s localhost:8009/v1/systemone -H 'content-type: application/json' -d '{
 | `POST` | `/v1/systemone/permute` | 同一个 Choice 问题换多种选项顺序各跑一遍，看答案是否稳定 |
 | `POST` | `/v1/systemone/separate` | 每个问题各跑一次前向（用于对比"打包提问 vs 分开提问"） |
 
-## 为什么是 `kev-serve` 而不是 `python -m kev.serve`
+## `kev-serve`：本仓库对上游的两处包装
+
+`kev-serve` 是**本仓库唯一的运行时改动**，它只做两件事，其余全部沿用上游（设备选择、`LoadOptions.from_env`、
+CUDA 上的 bf16 默认值、`kev.serve` 的整个参数面）。
+
+### ① bind 地址
 
 上游 `kev/serve.py` 最后一行是：
 
@@ -192,16 +229,43 @@ uvicorn.run(app, host="127.0.0.1", port=a.port)
 在笔记本上没问题，但在容器里这意味着服务只监听回环地址，Docker 的 `-p 8009:8009` 是 DNAT 到容器的
 eth0 地址上的，永远打不通 —— 而且**两端都不报错**，属于静默失败。
 
-镜像里的 `kev-serve` 是对上游启动流程的最小包装：除了把 bind 地址从环境变量取以外，
-其它什么都不改（设备选择、`LoadOptions.from_env`、CUDA 上用 bf16 的默认值全部沿用上游）。
-它通过在 `kev.serve.main()` 之前替换 `uvicorn.run` 实现，而不是复制一份 `main()` —— 复制会随着上游改动悄悄腐烂。
+实现方式是在 `kev.serve.main()` 之前替换 `uvicorn.run`，而不是复制一份 `main()` —— 复制会随上游改动悄悄腐烂。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `KEV_HOST` | `0.0.0.0` | bind 地址。设成空字符串则退回上游的 `127.0.0.1`；设成具体网卡地址可收窄暴露面 |
-| `KEV_PORT` | 未设置 | 设置后优先于 `--port`，方便 compose / `.env` 管理 |
+| `KEV_HOST` | `0.0.0.0` | bind 地址。设为空字符串则退回上游的 `127.0.0.1`；设成具体网卡地址可收窄暴露面 |
+| `KEV_PORT` | 未设置 | 优先于上游的 `--port`，方便 compose / `.env` 管理 |
 
-**不想用这个包装层的话**，也可以让上游原样跑，代价是要放弃端口映射、改用 host 网络：
+### ② 基座模型来源
+
+如上一节所述，基座由 checkpoint 的 `head.pt` 声明，上游没有覆盖入口。`kev-serve` 补上两个参数，
+在读完 `head.pt` 之后改写 `Meta.base` / `Meta.base_revision`：
+
+| CLI | 环境变量 | 说明 |
+| --- | --- | --- |
+| `--base-model PATH_OR_REPO_ID` | `KEV_BASE_MODEL` | 覆盖基座：本地目录或 Hub 仓库 ID。不传＝沿用 checkpoint 声明的值 |
+| `--base-revision REV` | `KEV_BASE_REVISION` | 钉住分支 / tag / commit SHA。传空字符串 `""` = 不钉（用仓库默认版本） |
+
+优先级 **CLI > 环境变量 > checkpoint**。指向本地目录且未显式给 `--base-revision` 时，revision 自动置空。
+不传任何一项时行为与上游完全一致（有测试覆盖这一条）。
+
+上游的 `--help` 由上游 parser 负责打印，看不到这两个参数，所以 `kev-serve --help` 会先补一段自己的说明：
+
+```bash
+docker exec -it kev kev-serve --help
+```
+
+为什么改 `Checkpoint.__init__` 而不是 `load`：这样一次性覆盖了所有读取该字段的地方 —— `load`
+（tokenizer + DecisionModel）、`hybrid_base()`（用 `AutoConfig` 判断是否混合骨干，进而决定 MLX 后端）、
+以及 `/v1/models` 返回的模型卡。最后那处正好也是**验证覆盖是否生效**的地方：
+
+```bash
+curl -s localhost:8009/v1/models | python -m json.tool | grep '"base"'
+```
+
+启动时如果覆盖生效，日志里会多一行 `kev-serve: base model Qwen/Qwen3.5-4B-Base@1001bb4d... -> ...`。
+
+**不想用这个包装层的话**，也可以让上游原样跑，代价是要放弃端口映射、改用 host 网络，且无法覆盖基座：
 
 ```bash
 docker run --rm --network host --gpus all \
@@ -215,7 +279,7 @@ docker run --rm --network host --gpus all \
 
 ## 常用环境变量
 
-除了上面的 `KEV_HOST` / `KEV_PORT`，上游还认这些（都是运行时 `-e` 传）：
+除了上面的 `KEV_HOST` / `KEV_PORT` / `KEV_BASE_MODEL` / `KEV_BASE_REVISION`，上游还认这些（都是运行时 `-e` 传）：
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
@@ -355,7 +419,8 @@ docker save kev:local | pigz > kev-local.tar.gz
 - **不推送镜像仓库**：CI 的产物只有 artifact，仓库里没有镜像副本，所以 artifact 过期前记得下载留存。
 - **不内置模型**：镜像里没有任何权重，checkpoint 和基座都靠 `-v` 挂载或 HF 缓存。
 - **驱动要求**：≥ 525（torch 自带的 CUDA 用户态库是 12.8，受 CUDA 12.x 次版本兼容规则约束）。
-- **`kev-serve` 是本仓库唯一对上游的改动**，只为改 bind 地址；上游源码本身未被修改。
+- **`kev-serve` 是本仓库唯一对上游的改动**，只做两件事：改 bind 地址、允许覆盖基座模型（`--base-model` /
+  `KEV_BASE_MODEL`）。上游源码本身未被修改，两条都在 `kev.checkpoint` 已有的接缝上完成。
 - **ENTRYPOINT 已清空**：NVIDIA 基镜像自带 `/opt/nvidia/nvidia_entrypoint.sh`，本镜像用 `ENTRYPOINT []` 清掉了，
   这样 `docker run <镜像> <你的命令>` 能干净地整体替换默认命令。
 - **`LD_LIBRARY_PATH` 保持基镜像的默认值**，没有覆盖 —— 覆盖会导致容器内找不到 CUDA 库。
